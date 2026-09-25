@@ -795,7 +795,7 @@ class HindcastSource:
     file_mask: str = "*.nc"
     mesh: Path | None = None
 
-    KEYS = ["input_dir", "file_mask", "mesh"]
+    KEYS = ["input_dir", "file_mask", "grd_file_name", "mesh"]
 
     @classmethod
     def from_entry(cls, name: str, raw: Any, where: str, base: Path | None) -> "HindcastSource":
@@ -804,11 +804,13 @@ class HindcastSource:
             return cls(name=name, input_dir=_machine_path(raw))
         spot = f"{where}.hindcasts.{name}"
         _check_unknown(raw, cls.KEYS, spot)
+        grd_file_name = raw.get("grd_file_name")
         mesh = raw.get("mesh")
         return cls(
             name=name,
             input_dir=_machine_path(_require(raw, "input_dir", spot)),
             file_mask=str(raw.get("file_mask", "*.nc")),
+            grd_file_name=None if grd_file_name is None else _relative_to(_machine_path(grd_file_name), base),
             mesh=None if mesh is None else _relative_to(_machine_path(mesh), base),
         )
 

@@ -175,7 +175,7 @@ def write_mesh(mesh: Mesh, path: str | Path) -> Path:
 # deriving one from a hindcast
 # --------------------------------------------------------------------------
 
-def derive_mesh(input_dir: Path, file_mask: str, out: Path, *, echo=print) -> Path:
+def derive_mesh(input_dir: Path, file_mask: str, out: Path, *, grd_file_name: Path | None = None, echo=print) -> Path:
     """Build a mesh from a hindcast by having OceanTracker read it.
 
     OceanTracker writes `grid000.nc` while setting up a run, *before* it needs
@@ -201,6 +201,13 @@ def derive_mesh(input_dir: Path, file_mask: str, out: Path, *, echo=print) -> Pa
 
     echo(f"  reading {input_dir}/{file_mask}")
     with tempfile.TemporaryDirectory(prefix="edna_mesh_") as tmp:
+        reader_params = {
+            "input_dir": str(input_dir),
+            "file_mask": file_mask,
+        }
+        if grd_file_name is not None:
+            reader_params["grd_file_name"] = str(grd_file_name)
+
         params = {
             "root_output_dir": tmp,
             "output_file_base": "mesh",
@@ -209,7 +216,7 @@ def derive_mesh(input_dir: Path, file_mask: str, out: Path, *, echo=print) -> Pa
             "write_tracks": False,
             "time_buffer_size": 2,         # one buffer's worth of hindcast, not 25
             "screen_output_time_interval": 3600.0,
-            "reader": {"input_dir": str(input_dir), "file_mask": file_mask},
+            "reader": reader_params,
         }
         # The run is *expected* to end with "No particle release_groups found", so
         # its screen output is captured rather than shown: a page of OceanTracker
@@ -267,4 +274,4 @@ def ensure_mesh(profile: MachineProfile, hindcast_name: str, *,
         return target
 
     echo(f"deriving the mesh for {hindcast_name!r}")
-    return derive_mesh(entry.input_dir, entry.file_mask, target, echo=echo)
+    return derive_mesh(entry.input_dir, entry.file_mask, target, grd_file_name=entry.grd_file_name, echo=echo)

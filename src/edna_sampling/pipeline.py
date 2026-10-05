@@ -16,6 +16,7 @@ import numpy as np
 
 from edna_sampling.config import ConfigError, MachineProfile, SiteConfig
 from edna_sampling.mesh import load_mesh
+from edna_sampling.release_points import detect_flooded_fraction_reader
 
 __all__ = [
     "release_points_path",
@@ -112,15 +113,22 @@ def ensure_release_points(
     from edna_sampling.mesh import ensure_mesh
 
     rp = site.release_points
-    schism_paths = None
+    hindcast_paths = None
+    hindcast_type = None
+
     if rp.min_flooded_fraction is not None:
         # the flooded-fraction mask must be computed over the same record the
         # model itself reads, or "always wet" means something different to the
         # two of them
-        schism_paths = hindcast_files(site, profile)
+        hindcast_paths = hindcast_files(site, profile)
+        entry = profile.hindcast(site.hindcast)
+        hindcast_type = detect_flooded_fraction_reader(
+            hindcast_paths,
+            entry.reader_type,
+        )
 
     mesh = load_mesh(ensure_mesh(profile, site.hindcast))
-    points = _generate(site, mesh, schism_paths)
+    points = _generate(site, mesh, hindcast_paths, hindcast_type)
     cache.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(cache, points, delimiter=",")
 
@@ -129,7 +137,7 @@ def ensure_release_points(
     return points, True
 
 
-def _generate(site: SiteConfig, mesh, schism_paths: Sequence[str] | None) -> np.ndarray:
+def _generate(site: SiteConfig, mesh, hindcast_paths: Sequence[str] | None, hindcast_type: str | None) -> np.ndarray:
     from edna_sampling.release_points import generate_release_locations_using_lloyd_relax
 
     rp = site.release_points
@@ -139,8 +147,9 @@ def _generate(site: SiteConfig, mesh, schism_paths: Sequence[str] | None) -> np.
         depth_range=rp.depth_range,
         n_points=rp.n,
         seed=rp.seed,
-        schism_output_paths=list(schism_paths) if schism_paths else None,
+        hindcast_output_paths=list(hindcast_paths) if hindcast_paths else None,
         min_flooded_fraction=rp.min_flooded_fraction,
+        hindcast_type=hindcast_type,
         echo=print,
     )
     points = np.asarray(points, dtype=float)

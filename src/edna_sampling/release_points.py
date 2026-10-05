@@ -56,6 +56,17 @@ def _depth_band_polygon(triang, node_depth, depth_range, bbox_poly):
 _SCHISM_VARS = ('SCHISM_hgrid_node_x', 'SCHISM_hgrid_node_y',
                 'SCHISM_hgrid_face_nodes', 'wetdry_node')
 
+_SHYFEM_VARS = ("water_level", "total_depth")
+
+def detect_flooded_fraction_reader(paths, reader_type):
+    if reader_type is not None:
+        return reader_type
+
+    with xr.open_dataset(paths[0]) as ds:
+        if all(v in ds for v in _SHYFEM_VARS):
+            return "shyfem"
+
+    return "schism"
 
 def _require_schism(ds, path):
     """Fail with the reason, not with a KeyError three frames down.
@@ -77,8 +88,15 @@ def _require_schism(ds, path):
             f"and model-area polygon alone."
         )
 
+def _require_shyfem(ds, path):
+    missing = [v for v in _SHYFEM_VARS if v not in ds]
+    if missing:
+        raise ValueError(
+            f"release_points.min_flooded_fraction needs SHYFEM wet/dry output, "
+            f"and {path} has no {', '.join(missing)}."
+        )
 
-def _flooded_fraction_polygon(schism_output_paths, min_flooded_fraction, bbox_poly):
+def _flooded_fraction_polygon_schism(schism_output_paths, min_flooded_fraction, bbox_poly):
     """
     Build a polygon covering only the parts of the domain that are wet at
     least `min_flooded_fraction` of the time, based on SCHISM's per-node
@@ -115,6 +133,139 @@ def _flooded_fraction_polygon(schism_output_paths, min_flooded_fraction, bbox_po
     ]
     region = unary_union(flooded_polys)
     return region.intersection(bbox_poly)
+
+def _flooded_fraction_polygon_shyfem(
+    mesh,
+    shyfem_output_paths,
+    min_flooded_fraction,
+    bbox_poly,
+    minimum_total_water_depth=0.25,
+):
+    """Build a polygon from SHYFEM cells that are wet for enough of the hindcast.
+
+    A node is considered wet when:
+
+        water_level + water_depth >= minimum_total_water_depth
+
+    A triangle is considered wet at a given time only if all three of
+    its nodes are wet. The flooded fraction of each triangle is then
+    the fraction of hindcast time steps for which the triangle is wet.
+
+    Parameters
+    ----------
+    mesh : Mesh
+        Mesh containing node coordinates and triangle connectivity.
+    shyfem_output_paths : sequence of str
+        Paths to SHYFEM hindcast NetCDF files.
+    min_flooded_fraction : float
+        Minimum fraction of the hindcast during which a triangle must be
+        wet to be included.
+    bbox_poly : shapely geometry
+        Bounding polygon used to clip the resulting flooded region.
+    minimum_total_water_depth : float, default=0.25
+        Minimum total water depth, in metres, used to distinguish wet
+        from dry nodes, following OceanTracker's SHYFEM handling.
+
+    Returns
+    -------
+    shapely.geometry.base.BaseGeometry
+        Polygon representing the part of the mesh satisfying the
+        flooded-fraction criterion.
+    """
+    import xarray as xr
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    # Check that the first file contains the variables required for the
+    # SHYFEM flooded-fraction calculation.
+
+    with xr.open_dataset(shyfem_output_paths[0]) as ds:
+        _require_shyfem(ds, shyfem_output_paths[0])
+
+    # Accumulate wet/dry information over all hindcast files.
+
+    wet_count = np.zeros(mesh.triangles.shape[0], dtype=np.int64)
+    n_time_total = 0
+
+    for path in shyfem_output_paths:
+
+        with xr.open_dataset(path) as ds:
+            _require_shyfem(ds, path)
+
+            water_level = np.asarray(ds["water_level"].values)
+            water_depth = np.asarray(ds["total_depth"].values)
+
+            # OceanTracker's SHYFEM reader treats NaN water levels as
+            # shallow water above the bed by 0.05 m.
+            bed = -water_depth
+
+            water_level = water_level.copy()
+            is_nan = np.isnan(water_level)
+
+            bed_2d = np.broadcast_to(bed, water_level.shape)
+            water_level[is_nan] = bed_2d[is_nan] + 0.05
+
+            # Node wet/dry status
+            # wet if:
+            #     water_level + water_depth >= minimum_total_water_depth
+
+            node_wet = (
+                water_level
+                + water_depth[np.newaxis, :]
+                >= minimum_total_water_depth
+            )
+
+            # Triangle wet/dry status
+            # A triangle is wet only if ALL three nodes are wet.
+            #
+            # node_wet:
+            #     (time, node)
+            # mesh.triangles:
+            #     (triangle, 3)
+            # result:
+            #     (time, triangle)
+
+            triangle_wet = node_wet[:, mesh.triangles].all(axis=2)
+
+            # Count the number of wet time steps for each triangle.
+            wet_count += triangle_wet.sum(axis=0)
+
+            n_time_total += triangle_wet.shape[0]
+
+    if n_time_total == 0:
+        raise ValueError(
+            "No time steps found in SHYFEM output files."
+        )
+
+    # Fraction of time during which each triangle is wet.
+    fraction_wet = wet_count / n_time_total
+
+    # Keep triangles satisfying the requested minimum flooded fraction.
+    triangle_ok = fraction_wet >= min_flooded_fraction
+
+    # Convert accepted triangles into polygons.
+    polygons = []
+
+    for triangle in mesh.triangles[triangle_ok]:
+        coords = [
+            (
+                mesh.node_x[node],
+                mesh.node_y[node],
+            )
+            for node in triangle
+        ]
+        polygons.append(Polygon(coords))
+
+    if not polygons:
+        return bbox_poly.intersection(
+            Polygon()
+        )
+
+    flooded_region = unary_union(polygons)
+
+    # Limit the flooded region to the bounding polygon used by the
+    # release-point generation.
+    return flooded_region.intersection(bbox_poly)
 
 
 def _random_points_in_polygon(region, n_points, rng):
@@ -261,14 +412,17 @@ def generate_release_locations_using_lloyd_relax(
     cv_target=0.05,
     max_iter=100,
     seed=None,
-    schism_output_paths=None,
+    hindcast_output_paths=None,
+    hindcast_type=None,
     min_flooded_fraction=None,
     echo=None,
 ):
     """
-    schism_output_paths (list[str] or None): paths to SCHISM `schout_*.nc`
-        files to compute flooded-fraction from. Required if
-        `min_flooded_fraction` is set.
+    hindcast_output_paths (list[str] or None): paths to `*.nc`
+        files to compute flooded-fraction from. Required if `min_flooded_fraction` is set.
+    hindcast_type (str): name of the hydrodinamic output type given in input.
+        It is not mandatory: it is a shortcut to decide which function to use in order to
+        use min_flooded_fraction when specified, and it is used only in relation with this parameter
     min_flooded_fraction (float or None): minimum fraction of the SCHISM
         record (0-1) a location must be wet (`wetdry_node == 0`) to be
         eligible for a release point, in addition to `depth_range`. E.g.
@@ -306,14 +460,31 @@ def generate_release_locations_using_lloyd_relax(
         )
 
     if min_flooded_fraction is not None:
-        if not schism_output_paths:
+        if not hindcast_output_paths:
             raise ValueError(
-                "schism_output_paths is required when min_flooded_fraction is set."
+                "hindcast_output_paths is required when min_flooded_fraction is set."
             )
-        flooded_region = _flooded_fraction_polygon(
-            schism_output_paths, min_flooded_fraction, bbox_poly
-        )
+
+        if hindcast_type == "shyfem":
+            flooded_region = _flooded_fraction_polygon_shyfem(
+                mesh,
+                hindcast_output_paths,
+                min_flooded_fraction,
+                bbox_poly,
+            )
+        elif hindcast_type == "schism":
+            flooded_region = _flooded_fraction_polygon_schism(
+                hindcast_output_paths,
+                min_flooded_fraction,
+                bbox_poly,
+            )
+        else:
+            raise ValueError(
+                f"Unknown flooded-fraction reader type: {hindcast_type!r}"
+            )
+
         region = region.intersection(flooded_region)
+
         if region.is_empty:
             raise ValueError(
                 f"No area satisfies depth_range={depth_range} AND "

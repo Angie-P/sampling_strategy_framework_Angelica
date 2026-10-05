@@ -793,9 +793,11 @@ class HindcastSource:
     name: str
     input_dir: Path
     file_mask: str = "*.nc"
+    grd_file_name: Path | None = None # the .grd file must be specified to reconstruct the grid of  Shyfem outputs
     mesh: Path | None = None
+    reader_type: str | None = None # this parameter is a shortcut that, if specified, is used only to apply min_flooded_fraction
 
-    KEYS = ["input_dir", "file_mask", "grd_file_name", "mesh"]
+    KEYS = ["input_dir", "file_mask", "grd_file_name", "mesh", "reader_type"]
 
     @classmethod
     def from_entry(cls, name: str, raw: Any, where: str, base: Path | None) -> "HindcastSource":
@@ -806,12 +808,20 @@ class HindcastSource:
         _check_unknown(raw, cls.KEYS, spot)
         grd_file_name = raw.get("grd_file_name")
         mesh = raw.get("mesh")
+        reader_type = raw.get("reader_type")
+        if reader_type not in (None, "shyfem", "schism"):
+            raise ConfigError(
+                f"{where}.reader_type: must be one of 'shyfem', 'schism', or null, "
+                f"got {reader_type!r}"
+            )
+
         return cls(
             name=name,
             input_dir=_machine_path(_require(raw, "input_dir", spot)),
             file_mask=str(raw.get("file_mask", "*.nc")),
             grd_file_name=None if grd_file_name is None else _relative_to(_machine_path(grd_file_name), base),
             mesh=None if mesh is None else _relative_to(_machine_path(mesh), base),
+            reader_type = reader_type
         )
 
 

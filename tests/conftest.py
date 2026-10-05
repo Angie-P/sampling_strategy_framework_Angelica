@@ -1,6 +1,7 @@
 """Shared fixtures. Deliberately free of hindcast data or model runs: everything
 here must pass in seconds on a laptop with no access to an HPC filesystem."""
 
+import numpy as np
 import pytest
 
 
@@ -40,3 +41,18 @@ def profile_dict(tmp_path):
         "output_root": str(tmp_path / "out"),
         "local": {"n_parallel_jobs": 2},
     }
+
+
+@pytest.fixture
+def folded_mesh():
+    """The four folded elements of the SHYFEM Venice grid, recentred and scaled
+    by 1e4, as (x, y, triangles). Node 3 sits just across edge 5-2 of the large
+    triangle 0, so the three small triangles overlap it and that edge is a seam
+    with nothing stitched to it. matplotlib's trifinder refuses this mesh.
+
+    Points by where they fall: (-4.9, -3.7) only in triangle 0, (4.9, 3.7) only
+    in triangle 2, (9.75, -2.36) in the overlap of triangles 0 and 1."""
+    x = np.array([-6.6, 16.6, -6.7, 4.7, -22.1, 14.2])
+    y = np.array([12.0, -1.2, 7.9, 0.4, -14.1, -5.0])
+    tris = np.array([[5, 2, 4], [1, 3, 5], [1, 0, 3], [0, 2, 3]])
+    return x, y, tris

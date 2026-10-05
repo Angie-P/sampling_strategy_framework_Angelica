@@ -63,6 +63,11 @@ def effective_volume(x_stats, y_stats, cell_area, x_grid, y_grid, triangles,
 
         V_eff = A_cell * mean_over_subpoints( clip(water_depth, 0, tow_depth) )
 
+    Each sub-point is located on the model's own triangles and the depth
+    interpolated linearly there (`mesh.TriangleLocator`), so a sub-point is wet
+    exactly where the model has water. That also keeps working on a mesh with
+    overlapping triangles, which matplotlib's trifinder rejects outright.
+
     `policy="drop"` instead zeroes any cell with a dry sub-point, which is the
     conservative variant worth a sensitivity check; `"weight"` is the default
     because dropping discards real coastal detections and makes the footprint
@@ -71,8 +76,7 @@ def effective_volume(x_stats, y_stats, cell_area, x_grid, y_grid, triangles,
     Tide is not included: that needs SCHISM `elev` and would make this a
     (time, y, x) field. See docs/2d-stats-assessment.md section 3.
     """
-    from matplotlib.tri import Triangulation
-    from scipy.interpolate import griddata
+    from edna_sampling.mesh import TriangleLocator
 
     if policy not in ("weight", "drop"):
         raise ConfigError(f"partial-cell policy must be 'weight' or 'drop', got {policy!r}")
@@ -88,21 +92,17 @@ def effective_volume(x_stats, y_stats, cell_area, x_grid, y_grid, triangles,
     frac = (np.arange(subsample) + 0.5) / subsample - 0.5
     ox, oy = np.meshgrid(frac * dx, frac * dy, indexing="xy")
 
-    known = ~np.isnan(water_depth)
-    pts = np.column_stack([x_grid[known], y_grid[known]])
-    vals = water_depth[known]
-    trifinder = Triangulation(x_grid, y_grid, triangles).get_trifinder()
+    locator = TriangleLocator(x_grid, y_grid, triangles)
 
     X, Y = np.meshgrid(x_stats, y_stats, indexing="xy")
     thickness = np.zeros(X.shape, dtype=float)
     in_domain = np.zeros(X.shape, dtype=bool)
 
     for k in range(ox.size):
-        xs = X + ox.flat[k]
-        ys = Y + oy.flat[k]
-        depth = griddata(pts, vals, (xs, ys), method="linear", fill_value=np.nan)
-        inside = trifinder(xs.ravel(), ys.ravel()).reshape(xs.shape) != -1
-        wet = np.where(inside & ~np.isnan(depth), np.clip(depth, 0.0, tow_depth), 0.0)
+        tri, weights = locator.locate(X + ox.flat[k], Y + oy.flat[k])
+        inside = tri != -1
+        depth = locator.interpolate(water_depth, tri, weights)
+        wet = np.where(np.isnan(depth), 0.0, np.clip(depth, 0.0, tow_depth))
         thickness += wet
         in_domain |= inside
     thickness /= ox.size
@@ -232,12 +232,10 @@ def condense(site: SiteConfig, profile: MachineProfile, *, out: Path | None = No
     # be applied - and re-applied differently - in post-processing. Filtering in
     # the model (`water_depth_min` on the statistic) bakes the choice into 400
     # chunks of output and cannot be undone without re-running.
-    from scipy.interpolate import griddata as _griddata
+    from edna_sampling.mesh import TriangleLocator
+    locator = TriangleLocator(x_grid, y_grid, triangles)
     _X, _Y = np.meshgrid(np.asarray(x_stats, float), np.asarray(y_stats, float), indexing="xy")
-    _known = ~np.isnan(water_depth)
-    cell_depth = _griddata(np.column_stack([x_grid[_known], y_grid[_known]]),
-                           water_depth[_known], (_X, _Y), method="linear",
-                           fill_value=np.nan)
+    cell_depth = locator.interpolate(water_depth, *locator.locate(_X, _Y))
 
     conc = None
     group_names, times = [], None
@@ -276,7 +274,8 @@ def condense(site: SiteConfig, profile: MachineProfile, *, out: Path | None = No
                           {"long_name": "stats cell intersects the model mesh"}),
             "cell_depth": (("y", "x"), cell_depth.astype(np.float32),
                            {"units": "m", "long_name":
-                            "still-water bathymetric depth at the stats cell centre"}),
+                            "still-water bathymetric depth at the stats cell centre, "
+                            "nan off the mesh"}),
         },
         coords={"time": times, "release_group": np.array(group_names, dtype=object),
                 "x": x_stats, "y": y_stats},

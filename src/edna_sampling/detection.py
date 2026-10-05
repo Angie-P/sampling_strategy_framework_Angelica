@@ -1,6 +1,7 @@
 """The detection model, the station optimisers, and the geometry they need.
 
-Pure array code: numpy, scipy and matplotlib.tri, nothing else. In particular no
+Pure array code: numpy at import time, plus `mesh.TriangleLocator` (shapely)
+inside the two functions that need the model mesh. In particular no
 oceantracker, no xarray and no numba at import time, so this module installs and
 loads on a laptop that will never run the model.
 
@@ -16,8 +17,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from matplotlib.tri import Triangulation
-from scipy.interpolate import griddata
 
 __all__ = [
     "greedy", "greedy_fast", "simulated_annealing", "genetic_algorithm",
@@ -293,22 +292,13 @@ def mask_below_seafloor(c, x_stats, y_stats, z_stats, x_grid, y_grid, triangles,
     # Create 2D meshgrid for stats grid
     X_stats, Y_stats = np.meshgrid(x_stats, y_stats, indexing='xy')
 
-    # Interpolate water depth from irregular grid to stats grid
-    # Remove any NaN values from the source data
-    valid_mask = ~np.isnan(water_depth)
-    points = np.column_stack([x_grid[valid_mask], y_grid[valid_mask]])
-    values = water_depth[valid_mask]
-
-    # Interpolate to stats grid
-    water_depth_stats = griddata(
-        points, 
-        values, 
-        (X_stats, Y_stats), 
-        # method='nearest',
-        method='linear',
-        # method='cubic',
-        fill_value=np.nan  
-    )
+    # Locate each stats point on the model's own triangles and interpolate the
+    # water depth there: nan off the mesh, and no matplotlib trifinder, which
+    # refuses a mesh with overlapping triangles (see mesh.TriangleLocator)
+    from edna_sampling.mesh import TriangleLocator
+    locator = TriangleLocator(x_grid, y_grid, triangles)
+    triangle_indices, weights = locator.locate(X_stats, Y_stats)
+    water_depth_stats = locator.interpolate(water_depth, triangle_indices, weights)
 
     depth_layer_centers = z_stats
     depth_layer_top = depth_layer_centers - np.diff(z_stats)[0]/2
@@ -324,23 +314,12 @@ def mask_below_seafloor(c, x_stats, y_stats, z_stats, x_grid, y_grid, triangles,
 
     for depth_idx in range(number_of_depth_layers):
         layer_depth = depth_layer_bottom[depth_idx]
-        # Mask where layer depth >= water depth (intersects or below seafloor)
-        mask_3d[:, :, depth_idx] = layer_depth >= water_depth_stats
+        # Mask where layer depth >= water depth (intersects or below seafloor),
+        # and where the depth is unknown
+        mask_3d[:, :, depth_idx] = ~(layer_depth < water_depth_stats)
 
-    # the interpolation griddata interpolation creates some artefacts outside the
-    # boundaries of the domain. use the triangulation to check if a grid cell is 
-    # outside of the domain and if so mask it
-    tri = Triangulation(x_grid, y_grid, triangles)
-    trifinder = tri.get_trifinder()
-
-    # Find which triangle each stats grid point belongs to
-    # Returns -1 if point is outside the triangulation
-    stats_points_x = X_stats.ravel()
-    stats_points_y = Y_stats.ravel()
-    triangle_indices = trifinder(stats_points_x, stats_points_y)
-
-    # Points outside domain have triangle_index == -1
-    outside_domain = (triangle_indices == -1).reshape(X_stats.shape)
+    # Points outside the mesh have triangle_index == -1
+    outside_domain = triangle_indices == -1
 
     # Combine: broadcast outside_domain (n_y, n_x) across z by adding a trailing axis
     mask_3d = mask_3d | outside_domain[:, :, np.newaxis]
@@ -446,11 +425,12 @@ def optimize_stations(detectable, k, method="greedy", *, random_seed=0):
 def valid_cell_mask(x_grid, y_grid, triangles, x_stats, y_stats):
     """Boolean (n_y, n_x) mask of stats-grid cells inside the model domain.
 
-    Excludes land and outside-mesh cells by triangulation membership - the same
+    Excludes land and outside-mesh cells by triangle membership - the same
     test `mask_below_seafloor` applies, exposed on its own for callers that want
     only the horizontal footprint.
     """
+    from edna_sampling.mesh import TriangleLocator
+
     X, Y = np.meshgrid(x_stats, y_stats, indexing="xy")
-    trifinder = Triangulation(x_grid, y_grid, triangles).get_trifinder()
-    inside = trifinder(X.ravel(), Y.ravel()) != -1
-    return inside.reshape(X.shape)
+    triangle_indices, _ = TriangleLocator(x_grid, y_grid, triangles).locate(X, Y)
+    return triangle_indices != -1

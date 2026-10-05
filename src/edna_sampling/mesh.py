@@ -32,7 +32,8 @@ import numpy as np
 
 from edna_sampling.config import ConfigError, MachineProfile
 
-__all__ = ["Mesh", "load_mesh", "write_mesh", "derive_mesh", "ensure_mesh"]
+__all__ = ["Mesh", "TriangleLocator", "load_mesh", "write_mesh", "derive_mesh",
+           "ensure_mesh"]
 
 FORMAT = "edna-mesh"
 FORMAT_VERSION = 1
@@ -76,14 +77,107 @@ class Mesh:
         return len(self.triangles)
 
     def triangulation(self):
-        """A `matplotlib.tri.Triangulation` over these nodes."""
+        """A `matplotlib.tri.Triangulation` over these nodes, for plotting and
+        contouring. To find which triangle a point is in use `locator()`: the
+        triangulation's trifinder refuses a mesh with overlapping triangles."""
         from matplotlib.tri import Triangulation
         return Triangulation(self.node_x, self.node_y, self.triangles)
+
+    def locator(self) -> "TriangleLocator":
+        """A `TriangleLocator` over these nodes and triangles."""
+        return TriangleLocator(self.node_x, self.node_y, self.triangles)
 
     def bounds(self) -> tuple[float, float, float, float]:
         """(min_x, min_y, max_x, max_y) of the nodes."""
         return (float(self.node_x.min()), float(self.node_y.min()),
                 float(self.node_x.max()), float(self.node_y.max()))
+
+
+# --------------------------------------------------------------------------
+# locating points on the mesh
+# --------------------------------------------------------------------------
+
+class TriangleLocator:
+    """Finds the triangle each point falls in, and its barycentric weights there.
+    
+    Reimplementing matplotlibs Triangulate such that it doesn't fall over
+    overlapping grid cells.
+    The weights interpolate a nodal field linearly on the model's own
+    triangles, which is the hydrodynamic model's interpolant - unlike
+    `scipy.interpolate.griddata`, which re-triangulates the nodes (Delaunay
+    over their convex hull) and so bridges land and differs from the model
+    wherever its mesh is not Delaunay.
+    """
+
+    def __init__(self, node_x, node_y, triangles, *, tol: float = 1e-9):
+        import shapely
+
+        self.node_x = np.asarray(node_x, dtype=float).ravel()
+        self.node_y = np.asarray(node_y, dtype=float).ravel()
+        # grid000.nc's triangles decode as float, because the variable carries a
+        # _FillValue
+        self.triangles = np.asarray(triangles).astype(np.int64)
+        self.tol = float(tol)
+
+        tx = self.node_x[self.triangles]
+        ty = self.node_y[self.triangles]
+        self._tree = shapely.STRtree(shapely.box(tx.min(axis=1), ty.min(axis=1),
+                                                 tx.max(axis=1), ty.max(axis=1)))
+
+        # barycentric transform relative to vertex c: [l_a, l_b] = inv @ (p - c),
+        # l_c = 1 - l_a - l_b. A degenerate triangle gets nan and never matches.
+        self._c = np.column_stack([tx[:, 2], ty[:, 2]])
+        dxa, dya = tx[:, 0] - tx[:, 2], ty[:, 0] - ty[:, 2]
+        dxb, dyb = tx[:, 1] - tx[:, 2], ty[:, 1] - ty[:, 2]
+        det = dxa * dyb - dxb * dya
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv = np.stack([[dyb, -dxb], [-dya, dxa]]) / np.where(det == 0, np.nan, det)
+        self._inv = np.moveaxis(inv, -1, 0)                       # (n_tri, 2, 2)
+
+    def locate(self, x, y):
+        """`(tri, weights)` for points `x`, `y` of any (matching) shape.
+
+        `tri` has their shape and is -1 outside the mesh; `weights` has a
+        trailing axis of 3 and is 0 outside. Points on the mesh boundary, within
+        `tol` in barycentric terms, count as inside.
+        """
+        import shapely
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        shape = x.shape
+        xr, yr = x.ravel(), y.ravel()
+        n = xr.size
+
+        tri = np.full(n, -1, dtype=np.int64)
+        weights = np.zeros((n, 3), dtype=float)
+        finite = np.flatnonzero(np.isfinite(xr) & np.isfinite(yr))
+        if finite.size == 0 or self.triangles.size == 0:
+            return tri.reshape(shape), weights.reshape(shape + (3,))
+
+        p, t = self._tree.query(shapely.points(xr[finite], yr[finite]))
+        p = finite[p]
+        d = np.column_stack([xr[p], yr[p]]) - self._c[t]
+        lab = np.einsum("nij,nj->ni", self._inv[t], d)
+        lam = np.column_stack([lab, 1.0 - lab.sum(axis=1)])
+        margin = lam.min(axis=1)
+
+        ok = margin >= -self.tol            # nan (degenerate) compares False
+        p, t, lam, margin = p[ok], t[ok], lam[ok], margin[ok]
+        order = np.lexsort((-margin, p))    # per point, deepest inside first
+        p, t, lam = p[order], t[order], lam[order]
+        first = np.unique(p, return_index=True)[1]
+        tri[p[first]] = t[first]
+        weights[p[first]] = lam[first]
+        return tri.reshape(shape), weights.reshape(shape + (3,))
+
+    def interpolate(self, values, tri, weights):
+        """A nodal field at points already located: nan outside the mesh, and
+        wherever a vertex of the containing triangle is nan."""
+        values = np.asarray(values, dtype=float)
+        tri = np.asarray(tri)
+        out = (values[self.triangles[np.maximum(tri, 0)]] * weights).sum(axis=-1)
+        return np.where(tri >= 0, out, np.nan)
 
 
 # --------------------------------------------------------------------------

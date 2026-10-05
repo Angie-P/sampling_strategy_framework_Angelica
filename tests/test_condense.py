@@ -80,6 +80,17 @@ def test_cells_outside_the_mesh_get_no_volume():
     assert not inside[0, 0]
 
 
+def test_a_mesh_with_overlapping_triangles_still_gives_a_volume(folded_mesh):
+    """The SHYFEM Venice grid has one element folded over its neighbours, which
+    made matplotlib's trifinder refuse the whole mesh and stopped `condense`.
+    These are those four elements, scaled, with the stats cell in the overlap."""
+    x, y, tris = folded_mesh
+    wd = np.full(6, 10.0)
+    vol, inside = effective_volume([9.75], [-2.36], np.array([[1.0]]), x, y, tris, wd, 19.0)
+    assert inside[0, 0]
+    assert vol[0, 0] == pytest.approx(10.0)
+
+
 @pytest.mark.parametrize("policy,match", [("nearest", "weight"), ("", "weight")])
 def test_unknown_partial_cell_policy_is_rejected(policy, match):
     x, y, tris, wd = _flat_mesh(100.0)

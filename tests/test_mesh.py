@@ -13,7 +13,7 @@ import pytest
 import xarray as xr
 
 from edna_sampling.config import ConfigError
-from edna_sampling.mesh import Mesh, load_mesh, write_mesh
+from edna_sampling.mesh import Mesh, TriangleLocator, load_mesh, write_mesh
 
 # a unit square split into two triangles, with a depth at each corner
 NODE_X = np.array([0.0, 1.0, 1.0, 0.0])
@@ -101,14 +101,14 @@ def test_non_triangular_connectivity_is_rejected():
              triangles=np.zeros((2, 4), dtype=np.int32))
 
 
-def test_bounds_and_triangulation_describe_the_same_mesh():
+def test_bounds_and_locator_describe_the_same_mesh():
     mesh = _mesh()
     assert mesh.bounds() == (0.0, 0.0, 1.0, 1.0)
     assert mesh.n_nodes == 4 and mesh.n_triangles == 2
-    # the trifinder is what release_points and detection use to test membership
-    finder = mesh.triangulation().get_trifinder()
-    assert finder(np.array([0.5]), np.array([0.4]))[0] != -1     # inside
-    assert finder(np.array([2.0]), np.array([2.0]))[0] == -1     # outside
+    # the locator is what condense and detection use to test membership
+    tri, _ = mesh.locator().locate(np.array([0.5, 2.0]), np.array([0.4, 2.0]))
+    assert tri[0] != -1                                          # inside
+    assert tri[1] == -1                                          # outside
 
 
 def test_the_written_form_is_much_smaller_than_an_oceantracker_grid(tmp_path):
@@ -133,3 +133,74 @@ def test_the_written_form_is_much_smaller_than_an_oceantracker_grid(tmp_path):
     }).to_netcdf(fat)
 
     assert Path(ours).stat().st_size < fat.stat().st_size / 3
+
+
+# --- locating points on the mesh ----------------------------------------------
+
+def _linear(x, y):
+    """Any containing triangle interpolates a linear field exactly, so it is the
+    right answer wherever a point is found, whichever triangle wins."""
+    return 1.0 + 3.0 * np.asarray(x) + 2.0 * np.asarray(y)
+
+
+def test_locator_reproduces_a_linear_field_on_the_mesh():
+    loc = TriangleLocator(NODE_X, NODE_Y, TRIANGLES)
+    rng = np.random.default_rng(1)
+    qx, qy = rng.random((2, 4, 25))          # any shape in, the same shape out
+    tri, w = loc.locate(qx, qy)
+    assert tri.shape == qx.shape and w.shape == qx.shape + (3,)
+    assert (tri != -1).all()
+    np.testing.assert_allclose(loc.interpolate(_linear(NODE_X, NODE_Y), tri, w),
+                               _linear(qx, qy))
+
+
+def test_locator_counts_nodes_and_edges_as_inside_and_the_rest_as_outside():
+    loc = TriangleLocator(NODE_X, NODE_Y, TRIANGLES)
+    qx = np.array([0.0, 1.0, 0.5, 0.5, 1.0, -0.1, 2.0, np.nan])
+    qy = np.array([0.0, 1.0, 0.5, 0.0, 0.5, 0.5, 2.0, 0.5])
+    tri, w = loc.locate(qx, qy)
+    np.testing.assert_array_equal(tri[:5] != -1, True)
+    np.testing.assert_array_equal(tri[5:], -1)
+    np.testing.assert_array_equal(w[5:], 0.0)
+    assert np.isnan(loc.interpolate(DEPTH, tri, w)[5:]).all()
+
+
+def test_locator_takes_the_float_triangles_a_grid000_decodes_to():
+    """xarray decodes grid000.nc's triangles as float64 (they carry a _FillValue)."""
+    loc = TriangleLocator(NODE_X, NODE_Y, TRIANGLES.astype(float))
+    tri, _ = loc.locate(np.array([0.7]), np.array([0.2]))
+    assert tri[0] == 0
+
+
+def test_locator_works_where_matplotlib_refuses_an_overlapping_mesh(folded_mesh):
+    x, y, tris = folded_mesh
+    from matplotlib.tri import Triangulation
+    with pytest.raises(RuntimeError, match="invalid"):
+        Triangulation(x, y, tris).get_trifinder()
+
+    loc = TriangleLocator(x, y, tris)
+    #               only tri 0   only tri 2  tris 0 and 1  outside
+    qx = np.array([-4.9,       4.9,        9.75,         30.0])
+    qy = np.array([-3.7,       3.7,        -2.36,        30.0])
+    tri, w = loc.locate(qx, qy)
+    assert tri[0] == 0 and tri[1] == 2 and tri[2] in (0, 1) and tri[3] == -1
+    np.testing.assert_allclose(loc.interpolate(_linear(x, y), tri, w)[:3],
+                               _linear(qx, qy)[:3])
+
+
+def test_a_point_in_a_large_triangle_beside_small_ones_is_found():
+    """Why bounding boxes and not nearest centroids: here the ten nearest
+    centroids all belong to the strip of small triangles, not to the large
+    triangle the point is actually in."""
+    xs = [0.0, 0.0, -10.0]
+    ys = [-5.0, 5.0, 0.0]
+    tris = [[0, 1, 2]]
+    for k in range(10):                      # a strip of slivers at x in [0.1, 0.2]
+        y0 = -0.5 + 0.1 * k
+        n = len(xs)
+        xs += [0.1, 0.2, 0.1]
+        ys += [y0, y0, y0 + 0.1]
+        tris.append([n, n + 1, n + 2])
+    loc = TriangleLocator(np.array(xs), np.array(ys), np.array(tris))
+    tri, _ = loc.locate(np.array([-0.05]), np.array([0.0]))
+    assert tri[0] == 0

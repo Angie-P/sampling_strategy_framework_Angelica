@@ -170,6 +170,14 @@ def build_params(
     chunk_points = list(release_points)[sl]
     out_dir = Path(root_dir) if root_dir is not None else root_output_dir(site, profile)
 
+    reader = {
+    "input_dir": str(profile.hindcast(site.hindcast).input_dir),
+    "file_mask": profile.hindcast(site.hindcast).file_mask,
+    }
+
+    if profile.hindcast(site.hindcast).grd_file_name is not None:
+        reader["grd_file_name"] = str(profile.hindcast(site.hindcast).grd_file_name)
+
     params: dict[str, Any] = {
         "root_output_dir": str(out_dir),
         "output_file_base": chunk_run_name(site, chunk_number),
@@ -181,12 +189,7 @@ def build_params(
         "write_tracks": model.write_tracks,
         "screen_output_time_interval": model.screen_output_time_interval,
         "time_buffer_size": model.time_buffer_size,
-        "reader": {
-            # no class_name: oceantracker detects the hindcast format from the
-            # files themselves, so this works for every format it supports
-            "input_dir": str(profile.hindcast(site.hindcast).input_dir),
-            "file_mask": profile.hindcast(site.hindcast).file_mask,
-        },
+        "reader": reader,
         "trajectory_modifiers": [{
             "name": "eDNA decay",
             "class_name": "CullRate",

@@ -190,18 +190,50 @@ def build_params(
         "screen_output_time_interval": model.screen_output_time_interval,
         "time_buffer_size": model.time_buffer_size,
         "reader": reader,
-        "trajectory_modifiers": [{
-            "name": "eDNA decay",
-            "class_name": "CullRate",
-            # exponential decay with the configured half-life
-            "decay_rate": math.log(2) / (model.edna_half_life_hours * 3600.0),
-        }],
         "resuspension": {
             "critical_friction_velocity": model.critical_friction_velocity,
         },
         "release_groups": _release_groups(site, chunk_points, sl.start),
         "particle_statistics": [_stats_params(s, model.output_time_interval) for s in site.stats],
     }
+
+    if model.decay_mode == "particle_decay":
+
+        # Original behaviour: decay of particles
+        params["trajectory_modifiers"] = [{
+            "name": "eDNA decay",
+            "class_name": "CullRate",
+            "decay_rate": math.log(2) / (
+                model.edna_half_life_hours * 3600.0
+            ),
+        }]
+
+    elif model.decay_mode == "dna_decay":
+
+        # Proprietà DNA associata a ciascuna particella.
+        params["particle_properties"] = [{
+            "name": "dna_copies",
+            "class_name": "ManuallyUpdatedParticleProperty",
+            "initial_value": site.source.copies_per_particle,
+            "dtype": "float64",
+            "units": "copies",
+            "description": "Number of DNA copies carried by each particle",
+        }]
+
+        # Stochastic decay of DNA copies.
+        # edna_half_life_hours needs to be converted to be used by DNADecay class of Oceantracker
+        half_life_seconds = model.edna_half_life_hours * 3600.0
+
+        params["trajectory_modifiers"] = [{
+            "name": "eDNA decay",
+            "class_name": "DNADecay",
+            "decay_time_scale": half_life_seconds / math.log(2),
+        }]
+
+    else:
+        raise ConfigError(
+            f"Unsupported decay mode: {model.decay_mode!r}"
+        )
 
     if model.tracks_writer_skip_properties:
         params["tracks_writer"] = {

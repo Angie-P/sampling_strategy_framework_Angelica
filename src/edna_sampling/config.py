@@ -24,6 +24,7 @@ import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Sequence
+from typing import ClassVar
 
 import yaml
 
@@ -230,6 +231,11 @@ class Model:
     duration_hours: float
     edna_half_life_hours: float
     critical_friction_velocity: float
+    decay_mode: str = "particle_decay"
+    DECAY_MODES: ClassVar[tuple[str, ...]] = (
+    "particle_decay",
+    "dna_decay",
+    )
     # when the releases begin; unset means the start of the hindcast files
     start: str | None = None
     output_time_interval: float = 3600.0
@@ -243,17 +249,26 @@ class Model:
     @classmethod
     def from_dict(cls, d: dict) -> "Model":
         where = "model"
-        allowed = ["time_step", "duration_hours", "edna_half_life_hours", "start",
+        allowed = ["time_step", "duration_hours", "edna_half_life_hours", "decay_mode", "start",
                    "critical_friction_velocity", "output_time_interval", "processors",
                    "particle_buffer_per_release_group", "time_buffer_size",
                    "screen_output_time_interval", "write_tracks",
                    "tracks_writer_skip_properties"]
         _check_unknown(d, allowed, where)
+
+        decay_mode = str(d.get("decay_mode", "particle_decay"))
+        if decay_mode not in cls.DECAY_MODES:
+            raise ConfigError(
+                f"model.decay_mode must be one of "
+                f"{', '.join(cls.DECAY_MODES)}, got {decay_mode!r}"
+            )
+
         return cls(
             time_step=_positive(_require(d, "time_step", where), f"{where}.time_step"),
             duration_hours=_positive(_require(d, "duration_hours", where), f"{where}.duration_hours"),
             edna_half_life_hours=_positive(_require(d, "edna_half_life_hours", where),
                                            f"{where}.edna_half_life_hours"),
+            decay_mode=decay_mode,
             start=(None if d.get("start") is None
                    else _isotime(d["start"], f"{where}.start")),
             critical_friction_velocity=float(_require(d, "critical_friction_velocity", where)),
@@ -321,6 +336,7 @@ class StatsSpec:
     near_seasurface: float | None = None
     near_seabed: float | None = None
     z_range: tuple[float, float] | None = None
+    variable: str = "count"
     extra: dict = field(default_factory=dict)
 
     KINDS = ("gridded_2d", "gridded_3d")
@@ -333,7 +349,7 @@ class StatsSpec:
                    "status_list", "water_depth_min", "water_depth_max", "write_connectivity",
                    "release_group_centered_grids", "layers", "z_min", "z_max",
                    "vertical_range_measured_relative_to", "near_seasurface", "near_seabed",
-                   "z_range", "extra"]
+                   "z_range", "variable", "extra"]
         _check_unknown(d, allowed, where)
 
         name = str(_require(d, "name", where))
@@ -409,6 +425,7 @@ class StatsSpec:
             near_seasurface=_opt_float(d.get("near_seasurface")),
             near_seabed=_opt_float(d.get("near_seabed")),
             z_range=None if zr is None else _pair(zr, f"{where}.z_range"),
+            variable=str(d.get("variable", "count")),
             extra=dict(d.get("extra", {}) or {}),
         )
 
@@ -641,13 +658,16 @@ class SiteConfig:
 
     @property
     def filtered_volume(self) -> float:
-        """Volume of eDNA-bearing water one sample effectively filters, in m^3.
+        """Effective sampling multiplier for the selected decay mode.
 
-        `individuals_per_source * copies_per_particle * sample_volume_m3`. Note
-        `copies_per_particle` comes from the `source:` block, so the model's
-        discretisation and the analysis cannot disagree about it.
+        In particle_decay mode, preserve the legacy calculation.
+        In dna_decay mode, the copies_per_particles factor is removed from the calculation
         """
         d = self.analysis.detection
+
+        if self.model.decay_mode == "dna_decay":
+            return d.individuals_per_source * d.sample_volume_m3
+
         return d.individuals_per_source * self.source.copies_per_particle * d.sample_volume_m3
 
     def statistic(self) -> StatsSpec:
@@ -671,6 +691,30 @@ class SiteConfig:
         raise ConfigError(
             f"this config defines {len(self.stats)} statistics ({known}), so "
             f"`analysis.statistic:` must say which one the analysis reads.")
+
+    def validate_decay_configuration(self) -> None:
+        """Check consistency between decay mode and selected statistics."""
+
+        if self.model.decay_mode != "dna_decay":
+            return
+
+        spec = self.statistic()
+
+        if spec.variable != "sum_dna_copies":
+            raise ConfigError(
+                "When model.decay_mode is 'dna_decay', "
+                "the selected statistic must use "
+                "variable='sum_dna_copies'."
+            )
+
+        particle_properties = spec.extra.get("particle_property_list", [])
+
+        if "dna_copies" not in particle_properties:
+            raise ConfigError(
+                "When model.decay_mode is 'dna_decay', "
+                "the selected statistic must include "
+                "'dna_copies' in extra.particle_property_list."
+            )
 
     @property
     def n_chunks(self) -> int:
@@ -718,6 +762,10 @@ class SiteConfig:
         )
         # fail early rather than inside a scheduled job
         cfg.source.particles_per_release(cfg.model.time_step)
+
+        # Check consistency between decay mode and selected statistics
+        cfg.validate_decay_configuration()
+        
         return cfg
 
     def validate_inputs(self, profile: "MachineProfile | None" = None) -> None:

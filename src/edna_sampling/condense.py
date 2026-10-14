@@ -153,10 +153,18 @@ def _tow_depth(spec) -> float:
 def _read_chunk(path: Path, spec) -> _Chunk:
     import xarray as xr
 
+    variable = spec.variable
+
     with xr.open_dataset(path) as ds:
-        counts = ds["count"].values
+        if variable not in ds:
+            raise ConfigError(
+                f"{path.name}: variable {variable!r} not found. "
+                f"Available variables: {', '.join(ds.data_vars)}"
+            )
+        counts = ds[variable].values
         times = ds["time"].values
         names = ds["release_group_names"].values if "release_group_names" in ds else None
+
     if counts.shape[1] != 1:
         raise ConfigError(
             f"{path.name}: expected one release group per chunk, found {counts.shape[1]}. "
@@ -260,11 +268,18 @@ def condense(site: SiteConfig, profile: MachineProfile, *, out: Path | None = No
         if echo and (i + 1) % 50 == 0:
             echo(f"  {i + 1}/{len(done)} chunks")
 
+    if spec.variable == "sum_dna_copies":
+        concentration_units = "copies m-3"
+        concentration_name = "tow-window-averaged eDNA copies concentration"
+    else:
+        concentration_units = "particles m-3"
+        concentration_name = "tow-window-averaged particle concentration"
+
     ds = xr.Dataset(
         data_vars={
             "conc_vert_avg": (("time", "release_group", "y", "x"), conc,
-                              {"units": "copies m-3",
-                               "long_name": "tow-window-averaged eDNA concentration"}),
+                              {"units": concentration_units,
+                               "long_name": concentration_name}),
             "effective_volume": (("y", "x"), volume.astype(np.float32),
                                  {"units": "m3", "long_name":
                                   "water volume of the tow window per stats cell"}),

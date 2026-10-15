@@ -88,7 +88,7 @@ def _public(results):
     return {k: v for k, v in results.items() if not k.startswith("_")}
 
 
-def write_figures(ds, results, out_dir: Path, *, dpi=150) -> list[Path]:
+def write_figures(ds, results, out_dir: Path, *, dpi=150, land_shapefile = None) -> list[Path]:
     """Render the single-site figures. Returns what was written."""
     import matplotlib
     matplotlib.use("Agg")
@@ -100,11 +100,58 @@ def write_figures(ds, results, out_dir: Path, *, dpi=150) -> list[Path]:
     t = results["time_index"]
     xs, ys = ds["x"].values, ds["y"].values
 
-    # 1. how many sources each cell can detect, at the chosen time
+    # FIGURE 1. HOW MANY SOURCES EACH CELL CAN DETECT, AT THE CHOSEN TIME
     fig, ax = plt.subplots(figsize=(6, 5))
     hot = results["_hot"][t]
-    im = ax.pcolormesh(xs, ys, np.where(hot > 0, hot, np.nan), shading="nearest")
-    fig.colorbar(im, ax=ax, label="sources detectable")
+
+    # Maximum number of detectable sources
+    max_sources = int(np.nanmax(hot))
+    # Avoid an invalid colormap if all cells have zero detectability
+    max_sources = max(1, max_sources)
+    # Discrete colormap: one colour for each integer count
+    cmap = plt.get_cmap("viridis", max_sources)
+    # Boundaries halfway between consecutive integers
+    bounds = np.arange(0.5, max_sources + 1.5, 1)
+    norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
+    # Hide cells where no source is detectable
+    hot_plot = np.where(hot > 0, hot, np.nan)
+
+    im = ax.pcolormesh(xs, ys, hot_plot, shading="nearest", cmap=cmap, norm=norm, zorder=1)
+
+    # Colourbar: one tick every 5 sources
+    ticks = np.arange(5, max_sources + 1, 5)
+    # Show the maximum value if it is not a multiple of 5
+    if max_sources < 5:
+        ticks = np.arange(1, max_sources + 1)
+    elif max_sources % 5 != 0:
+        ticks = np.append(ticks, max_sources)
+    fig.colorbar(im, ax=ax, ticks=ticks, label="sources detectable")
+
+    # Overlay land polygons, if a shapefile was supplied. 
+    # Note that the .shp file needs to come with the other files that have been created at the same time by QGIS, so put them together in the same folder
+    if land_shapefile is not None:
+        import geopandas as gpd
+
+        land = gpd.read_file(land_shapefile)
+
+        if land.crs is None:
+            raise ValueError(
+                "The land shapefile has no CRS defined. "
+                "Please specify its coordinate reference system."
+            )
+        # Convert land coordinates to geographic lon/lat
+        if land.crs.to_epsg() != 4326:
+            land = land.to_crs(epsg=4326)
+
+        land.plot(ax=ax, color="lightgrey", edgecolor="grey", linewidth=0.4, zorder=2)
+        # Restore the extent of the statistical grid
+        xmin, xmax = np.nanmin(xs), np.nanmax(xs)
+        ymin, ymax = np.nanmin(ys), np.nanmax(ys)
+        pad_x = (xmax - xmin) * 0.03
+        pad_y = (ymax - ymin) * 0.03
+        ax.set_xlim(xmin - pad_x, xmax + pad_x)
+        ax.set_ylim(ymin - pad_y, ymax + pad_y)
+
     # Only the stations that add coverage. The optimiser returns exactly k, and
     # any surplus beyond saturation sits on an arbitrary cell - drawing those
     # would put a marker where nothing is detectable.
@@ -113,17 +160,22 @@ def write_figures(ds, results, out_dir: Path, *, dpi=150) -> list[Path]:
     if useful:
         sx, sy = zip(*useful)
         n = len(useful)
-        ax.plot(sx, sy, "r*", markersize=14, markeredgecolor="k",
+        ax.plot(sx, sy, "r*", markersize=9, markeredgecolor="k",
                 label=f"{n} station{'s' if n > 1 else ''}"
                       + (f" ({len(results['stations_lonlat']) - n} more add nothing)"
                          if n < len(results["stations_lonlat"]) else ""))
         ax.legend(loc="upper right")
+
+    # Geographic aspect correction for longitude/latitude coordinates
+    lat0 = np.nanmean(ys)
+    ax.set_aspect(1 / np.cos(np.deg2rad(lat0)), adjustable="box")
+
     ax.set(xlabel="longitude", ylabel="latitude",
            title=f"{ds.attrs.get('run_name','')}  detectability at t={t}")
     p = out_dir / "detectability_map.png"
     fig.savefig(p, dpi=dpi, bbox_inches="tight"); plt.close(fig); written.append(p)
 
-    # 2. footprint area over time: spread across sources, plus the median source
+    # FIGURE 2. FOOTPRINT AREA OVER TIME: SPREAD ACROSS SOURCES, PLUS THE MEDIAN SOURCE
     fig, ax = plt.subplots(figsize=(6, 4))
     fp = results["_footprint"]
     hours = np.arange(fp.shape[0])
@@ -139,7 +191,7 @@ def write_figures(ds, results, out_dir: Path, *, dpi=150) -> list[Path]:
     p = out_dir / "footprint_timeseries.png"
     fig.savefig(p, dpi=dpi, bbox_inches="tight"); plt.close(fig); written.append(p)
 
-    # 3. diminishing returns from adding stations
+    # FIGURE 3. DIMINISHING RETURN FROM ADDING STATIONS
     fig, ax = plt.subplots(figsize=(6, 4))
     curve = np.asarray(results["coverage_curve"])
     k = np.arange(1, len(curve) + 1)

@@ -193,6 +193,10 @@ def build_params(
         "resuspension": {
             "critical_friction_velocity": model.critical_friction_velocity,
         },
+        "dispersion": {
+            "A_H": model.A_H,
+            "A_V": model.A_V,
+        },
         "release_groups": _release_groups(site, chunk_points, sl.start),
         "particle_statistics": [_stats_params(s, model.output_time_interval) for s in site.stats],
     }

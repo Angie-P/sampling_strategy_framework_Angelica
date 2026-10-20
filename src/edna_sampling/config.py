@@ -82,6 +82,12 @@ def _positive(value: Any, where: str) -> float:
         raise ConfigError(f"{where}: must be > 0, got {v}")
     return v
 
+def _non_negative(value: Any, where: str) -> float:
+    v = float(value)
+    if v < 0:
+        raise ConfigError(f"{where}: must be >= 0, got {v}")
+    return v
+
 
 # --------------------------------------------------------------------------
 # site config sections
@@ -231,6 +237,8 @@ class Model:
     duration_hours: float
     edna_half_life_hours: float
     critical_friction_velocity: float
+    A_H: float = 0
+    A_V: float = 0
     decay_mode: str = "particle_decay"
     DECAY_MODES: ClassVar[tuple[str, ...]] = (
     "particle_decay",
@@ -250,7 +258,7 @@ class Model:
     def from_dict(cls, d: dict) -> "Model":
         where = "model"
         allowed = ["time_step", "duration_hours", "edna_half_life_hours", "decay_mode", "start",
-                   "critical_friction_velocity", "output_time_interval", "processors",
+                   "critical_friction_velocity", "A_H", "A_V","output_time_interval", "processors",
                    "particle_buffer_per_release_group", "time_buffer_size",
                    "screen_output_time_interval", "write_tracks",
                    "tracks_writer_skip_properties"]
@@ -272,6 +280,8 @@ class Model:
             start=(None if d.get("start") is None
                    else _isotime(d["start"], f"{where}.start")),
             critical_friction_velocity=float(_require(d, "critical_friction_velocity", where)),
+            A_H=_non_negative(d.get("A_H", 0), f"{where}.A_H"),
+            A_V=_non_negative(d.get("A_V", 0), f"{where}.A_V"),
             output_time_interval=float(d.get("output_time_interval", 3600.0)),
             processors=int(d.get("processors", 20)),
             particle_buffer_per_release_group=(
